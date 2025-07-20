@@ -2,7 +2,7 @@
 
 This is a little tool that minimizes the currently focused window in Hyprland to the tray. It gets shown in the waybar tray. The icon title is the current window class or ttile, if the class is empty, so you might just have to adjust your waybar config to show the appropriate icon. I use t to keep my messeenger and mail apps in the background, so I still receive notifications. 
 
-Minimizing is done by mocing all the windows to a special workspace "minimized". It uses the DBus to notify waybar of these apps and provide, a menu to close or restore the app, but don't ask me, how; it doesn't survive a waybar restart for now, but I will modify it eventually.
+Minimizing is done by moving the respective window to a special workspace "minimized". It uses the DBus to notify waybar of these apps and provide a menu to close or restore the app, but don't ask me, how; it doesn't survive a waybar restart for now, but I will modify it eventually.
 
 Do with this thatever you want, I don't care, It's vibe coded. Honestly, I don't even know what the code actually does or how it works, and I don't want to, as long as it does what it does.
 
