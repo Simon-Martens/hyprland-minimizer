@@ -267,6 +267,20 @@ impl StatusNotifierItem {
     }
 
     #[dbus_interface(property)]
+    fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+        // The StatusNotifierItem specification defines the `ToolTip` property as a struct
+        // containing (icon_name, icon_data, title, description).
+        // Waybar uses the 'title' part of this struct for the tooltip text.
+        // We leave the icon fields empty and provide the window title.
+        (
+            String::new(),                  // icon_name
+            Vec::new(),                     // icon_data (an array of (width, height, pixels))
+            self.window_info.title.clone(), // title
+            String::new(),                  // description
+        )
+    }
+
+    #[dbus_interface(property)]
     fn item_is_menu(&self) -> bool {
         false
     }

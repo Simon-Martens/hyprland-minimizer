@@ -2,7 +2,7 @@
 # Place this in the root directory of your new Rust project.
 
 [package]
-name = "minimize-to-tray"
+name = "hyprland-minimizer"
 version = "0.1.0"
 edition = "2021"
 
