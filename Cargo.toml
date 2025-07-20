@@ -22,3 +22,4 @@ serde_json = "1.0"
 # For handling errors gracefully
 anyhow = "1.0"
 clap = { version = "4.5.4", features = ["derive"] }
+futures-util = "0.3"                                # <--- This is needed for the .next() method on streams

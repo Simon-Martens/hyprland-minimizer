@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Command;
@@ -412,28 +413,34 @@ async fn main() -> Result<()> {
         std::process::id()
     );
 
-    let _connection = ConnectionBuilder::session()?
+    let connection = ConnectionBuilder::session()?
         .name(bus_name.as_str())?
         .serve_at("/StatusNotifierItem", notifier_item)?
         .serve_at("/Menu", dbus_menu)?
         .build()
         .await?;
 
+    // Create an Arc of the connection to share with the watcher task.
+    let arc_conn = Arc::new(connection);
+
     println!("D-Bus service '{}' is running.", bus_name);
 
-    // 4. Register the item with the StatusNotifierWatcher
-    let watcher_proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&_connection)
-        .interface("org.kde.StatusNotifierWatcher")?
-        .path("/StatusNotifierWatcher")?
-        .destination("org.kde.StatusNotifierWatcher")?
-        .build()
-        .await?;
+    // 4. Initial registration with the StatusNotifierWatcher
+    let initial_registration_result = async {
+        let watcher_proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&*arc_conn)
+            .interface("org.kde.StatusNotifierWatcher")?
+            .path("/StatusNotifierWatcher")?
+            .destination("org.kde.StatusNotifierWatcher")?
+            .build()
+            .await?;
+        watcher_proxy
+            .call_method("RegisterStatusNotifierItem", &(bus_name.as_str(),))
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
 
-    println!("Registering with StatusNotifierWatcher...");
-    if let Err(e) = watcher_proxy
-        .call_method("RegisterStatusNotifierItem", &(bus_name.as_str(),))
-        .await
-    {
+    if let Err(e) = initial_registration_result {
         eprintln!("Could not register with StatusNotifierWatcher: {}", e);
         eprintln!("Is a tray like Waybar running?");
         let _ = hyprctl_dispatch(&format!(
@@ -443,6 +450,57 @@ async fn main() -> Result<()> {
         anyhow::bail!("Failed to register tray icon.");
     }
     println!("Registration successful.");
+
+    // NEW: Task to watch for Waybar restarts and re-register the icon.
+    let conn_clone_watcher = Arc::clone(&arc_conn);
+    let bus_name_clone = bus_name.clone();
+    tokio::spawn(async move {
+        let dbus_proxy = match zbus::fdo::DBusProxy::new(&*conn_clone_watcher).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[Watcher] Failed to connect to D-Bus proxy: {}", e);
+                return;
+            }
+        };
+
+        let mut owner_changes = match dbus_proxy.receive_name_owner_changed().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[Watcher] Failed to listen for owner changes: {}", e);
+                return;
+            }
+        };
+
+        println!("[Watcher] Watching for 'org.kde.StatusNotifierWatcher' restarts...");
+
+        while let Some(signal) = owner_changes.next().await {
+            if let Ok(args) = signal.args() {
+                if args.name() == "org.kde.StatusNotifierWatcher" && args.new_owner().is_some() {
+                    println!("[Watcher] Tray service detected. Re-registering icon.");
+                    let re_register_result = async {
+                        // Give the watcher a moment to get ready
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let watcher_proxy: Proxy<'_> =
+                            zbus::ProxyBuilder::new_bare(&*conn_clone_watcher)
+                                .interface("org.kde.StatusNotifierWatcher")?
+                                .path("/StatusNotifierWatcher")?
+                                .destination("org.kde.StatusNotifierWatcher")?
+                                .build()
+                                .await?;
+                        watcher_proxy
+                            .call_method("RegisterStatusNotifierItem", &(bus_name_clone.as_str(),))
+                            .await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+
+                    if let Err(e) = re_register_result {
+                        eprintln!("[Watcher] Failed to re-register icon: {}", e);
+                    }
+                }
+            }
+        }
+    });
 
     // 5. Start a background check to see if the window is closed or moved
     let window_address = window_info.address.clone();
