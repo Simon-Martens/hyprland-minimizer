@@ -1,15 +1,24 @@
 //! Main application logic for the minimize-to-tray utility.
 //! Place this file in the `src/` directory of your Rust project.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{interval, Duration};
 use zbus::zvariant::{ObjectPath, Value};
 use zbus::{dbus_interface, ConnectionBuilder, Proxy};
+
+// --- Command-Line Interface Definition ---
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// The address of the window to minimize. If not provided, minimizes the active window.
+    window_address: Option<String>,
+}
 
 // --- Hyprland Data Structures ---
 // These structs are used to deserialize the JSON output from `hyprctl`.
@@ -52,8 +61,6 @@ fn hyprctl_dispatch(command: &str) -> Result<()> {
     let status = Command::new("hyprctl")
         .arg("dispatch")
         .arg(command)
-        .stdout(Stdio::null()) // Suppress stdout
-        .stderr(Stdio::null()) // Suppress stderr
         .status()
         .with_context(|| format!("Failed to execute hyprctl dispatch: {}", command))?;
 
@@ -61,6 +68,16 @@ fn hyprctl_dispatch(command: &str) -> Result<()> {
         anyhow::bail!("hyprctl dispatch command '{}' failed", command);
     }
     Ok(())
+}
+
+/// Finds a window by its address from the list of all clients.
+fn get_window_by_address(address: &str) -> Result<WindowInfo> {
+    let clients: Vec<WindowInfo> =
+        hyprctl("clients").context("Failed to get client list from Hyprland.")?;
+    clients
+        .into_iter()
+        .find(|c| c.address == address)
+        .ok_or_else(|| anyhow!("Could not find a window with address '{}'", address))
 }
 
 // --- D-Bus Menu Implementation ---
@@ -79,29 +96,54 @@ impl DbusMenu {
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> (u32, (i32, HashMap<String, Value>, Vec<Value>)) {
+        println!("[D-Bus Menu] GetLayout called.");
+
+        // Item ID 1: Open on current workspace
         let mut open_props = HashMap::new();
         open_props.insert("type".to_string(), Value::from("standard"));
         open_props.insert(
             "label".to_string(),
             Value::from(format!("Open {}", self.window_info.title)),
         );
+        let open_item = Value::from((1i32, open_props, Vec::<Value>::new()));
 
+        // Item ID 2: Open on original workspace
+        let mut last_ws_props = HashMap::new();
+        last_ws_props.insert("type".to_string(), Value::from("standard"));
+        last_ws_props.insert(
+            "label".to_string(),
+            Value::from(format!(
+                "Open on original workspace ({})",
+                self.window_info.workspace.id
+            )),
+        );
+        let last_ws_item = Value::from((2i32, last_ws_props, Vec::<Value>::new()));
+
+        // Item ID 3: Close the window
         let mut close_props = HashMap::new();
         close_props.insert("type".to_string(), Value::from("standard"));
         close_props.insert(
             "label".to_string(),
             Value::from(format!("Close {}", self.window_info.title)),
         );
+        let close_item = Value::from((3i32, close_props, Vec::<Value>::new()));
 
-        let open_item = Value::from((1i32, open_props, Vec::<Value>::new()));
-        let close_item = Value::from((2i32, close_props, Vec::<Value>::new()));
-
+        // The root of the menu layout
         let mut root_props = HashMap::new();
         root_props.insert("children-display".to_string(), Value::from("submenu"));
 
-        let root_layout = (0i32, root_props, vec![open_item, close_item]);
-        let revision = 1u32;
+        let root_layout = (
+            0i32, // Root node ID is always 0
+            root_props,
+            vec![open_item, last_ws_item, close_item],
+        );
 
+        // Incrementing the revision number helps ensure clients fetch the new layout
+        let revision = 2u32;
+        println!(
+            "[D-Bus Menu] Serving layout revision {}: {:?}",
+            revision, root_layout
+        );
         (revision, root_layout)
     }
 
@@ -111,29 +153,26 @@ impl DbusMenu {
         ids: Vec<i32>,
         _property_names: Vec<String>,
     ) -> Vec<(i32, HashMap<String, Value>)> {
+        println!("[D-Bus Menu] GetGroupProperties called for IDs: {:?}", ids);
         let mut result = Vec::new();
         for id in ids {
             let mut props = HashMap::new();
-            match id {
-                1 => {
-                    props.insert(
-                        "label".to_string(),
-                        Value::from(format!("Open {}", self.window_info.title)),
-                    );
-                }
-                2 => {
-                    props.insert(
-                        "label".to_string(),
-                        Value::from(format!("Close {}", self.window_info.title)),
-                    );
-                }
+            let label = match id {
+                1 => format!("Open {}", self.window_info.title),
+                2 => format!(
+                    "Open on original workspace ({})",
+                    self.window_info.workspace.id
+                ),
+                3 => format!("Close {}", self.window_info.title),
                 _ => continue,
             };
+            props.insert("label".to_string(), Value::from(label));
             props.insert("enabled".to_string(), Value::from(true));
             props.insert("visible".to_string(), Value::from(true));
             props.insert("type".to_string(), Value::from("standard"));
             result.push((id, props));
         }
+        println!("[D-Bus Menu] Returning properties: {:?}", result);
         result
     }
 
@@ -144,21 +183,11 @@ impl DbusMenu {
             events.len()
         );
         for (id, event_id, data, timestamp) in events {
-            // We can just call the existing event handler logic for each event in the batch.
             self.event(id, &event_id, data, timestamp);
         }
     }
 
-    /// Handles a batch of "about to show" requests.
-    fn about_to_show_group(&self, ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
-        println!("[D-Bus Menu] AboutToShowGroup received for IDs: {:?}", ids);
-        // Return empty arrays for shown and hidden items, as we don't need
-        // to dynamically change the menu.
-        (vec![], vec![])
-    }
-
     /// Handles a single click event on a menu item.
-    /// Kept for compatibility, but Waybar uses `EventGroup`.
     fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
         println!(
             "[D-Bus Menu] Event received: id='{}', event_id='{}'",
@@ -167,9 +196,8 @@ impl DbusMenu {
         if event_id == "clicked" {
             let res = match id {
                 1 => {
-                    // Open
+                    // Open on current workspace
                     println!("[D-Bus Menu] 'Open' action triggered.");
-                    // Get the currently active workspace and move the window there.
                     match hyprctl::<Workspace>("activeworkspace") {
                         Ok(active_workspace) => hyprctl_dispatch(&format!(
                             "movetoworkspace {},address:{}",
@@ -188,7 +216,21 @@ impl DbusMenu {
                     }
                 }
                 2 => {
-                    // Close
+                    // Open on original workspace
+                    println!("[D-Bus Menu] 'Open on original workspace' action triggered.");
+                    hyprctl_dispatch(&format!(
+                        "movetoworkspace {},address:{}",
+                        self.window_info.workspace.id, self.window_info.address
+                    ))
+                    .and_then(|_| {
+                        hyprctl_dispatch(&format!(
+                            "focuswindow address:{}",
+                            self.window_info.address
+                        ))
+                    })
+                }
+                3 => {
+                    // Close the window
                     println!("[D-Bus Menu] 'Close' action triggered.");
                     hyprctl_dispatch(&format!("closewindow address:{}", self.window_info.address))
                 }
@@ -205,12 +247,17 @@ impl DbusMenu {
                 );
             }
 
-            // Exit after any menu action
             self.exit_notify.notify_one();
         }
     }
 
-    /// Kept for compatibility, but Waybar uses `AboutToShowGroup`.
+    /// Handles a batch of "about to show" requests.
+    fn about_to_show_group(&self, ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+        println!("[D-Bus Menu] AboutToShowGroup received for IDs: {:?}", ids);
+        (vec![], vec![])
+    }
+
+    /// Kept for compatibility.
     fn about_to_show(&self, _id: i32) -> bool {
         false
     }
@@ -268,15 +315,11 @@ impl StatusNotifierItem {
 
     #[dbus_interface(property)]
     fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
-        // The StatusNotifierItem specification defines the `ToolTip` property as a struct
-        // containing (icon_name, icon_data, title, description).
-        // Waybar uses the 'title' part of this struct for the tooltip text.
-        // We leave the icon fields empty and provide the window title.
         (
-            String::new(),                  // icon_name
-            Vec::new(),                     // icon_data (an array of (width, height, pixels))
-            self.window_info.title.clone(), // title
-            String::new(),                  // description
+            String::new(),
+            Vec::new(),
+            self.window_info.title.clone(),
+            String::new(),
         )
     }
 
@@ -292,8 +335,7 @@ impl StatusNotifierItem {
 
     // --- Methods ---
     fn activate(&self, _x: i32, _y: i32) {
-        println!("[D-Bus] Activate called");
-        // Get the currently active workspace and move the window there.
+        println!("[D-Bus] Activate called (left-click)");
         if let Ok(active_workspace) = hyprctl::<Workspace>("activeworkspace") {
             if let Err(e) = hyprctl_dispatch(&format!(
                 "movetoworkspace {},address:{}",
@@ -311,7 +353,7 @@ impl StatusNotifierItem {
     }
 
     fn secondary_activate(&self, _x: i32, _y: i32) {
-        println!("[D-Bus] SecondaryActivate called");
+        println!("[D-Bus] SecondaryActivate called (middle-click to close)");
         if let Err(e) =
             hyprctl_dispatch(&format!("closewindow address:{}", self.window_info.address))
         {
@@ -325,15 +367,24 @@ impl StatusNotifierItem {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Get active window info
-    let mut window_info: WindowInfo =
-        hyprctl("activewindow").context("Failed to get active window. Is a window focused?")?;
+    let args = Args::parse();
+
+    // 1. Get window info based on CLI arguments
+    let mut window_info = if let Some(address) = args.window_address {
+        println!("Attempting to minimize window with address: {}", address);
+        get_window_by_address(&address)?
+    } else {
+        println!("No window address provided, minimizing active window.");
+        hyprctl("activewindow").context("Failed to get active window. Is a window focused?")?
+    };
+
     println!(
-        "Minimizing window: '{}' ({})",
-        window_info.title, window_info.class
+        "Minimizing window: '{}' ({}) from workspace {}",
+        window_info.title, window_info.class, window_info.workspace.id
     );
 
     if window_info.class.is_empty() {
+        // Fallback to title if class is empty, for better icon matching
         window_info.class = window_info.title.clone();
     }
 
@@ -385,7 +436,6 @@ async fn main() -> Result<()> {
     {
         eprintln!("Could not register with StatusNotifierWatcher: {}", e);
         eprintln!("Is a tray like Waybar running?");
-        // Restore to original workspace if registration fails
         let _ = hyprctl_dispatch(&format!(
             "movetoworkspace {},address:{}",
             window_info.workspace.id, window_info.address
@@ -403,19 +453,13 @@ async fn main() -> Result<()> {
             interval.tick().await;
             match hyprctl::<Vec<WindowInfo>>("clients") {
                 Ok(clients) => {
-                    // Find our specific window in the list of all clients.
                     if let Some(client) = clients.iter().find(|c| c.address == window_address) {
-                        // Special workspaces in Hyprland have negative IDs.
-                        // If the workspace ID is positive, it means the window has been
-                        // moved to a regular, visible workspace by the user.
                         if client.workspace.id > 0 {
                             println!("Window restored externally. Exiting.");
                             check_task_exit_notify.notify_one();
                             break;
                         }
-                        // Otherwise, the window is still minimized, so we continue.
                     } else {
-                        // The window doesn't exist anymore (it was closed).
                         println!("Window closed externally. Exiting.");
                         check_task_exit_notify.notify_one();
                         break;
@@ -430,26 +474,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 6. Wait for a notification to exit (from click or window close/move)
+    // 6. Wait for a notification to exit
     println!("Application minimized to tray. Waiting for activation...");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\nInterrupted by Ctrl+C. Restoring window.");
-            // Get the currently active workspace and move the window there.
-            if let Ok(active_workspace) = hyprctl::<Workspace>("activeworkspace") {
-                // Attempt to restore window, but don't panic if it fails
-                let _ = hyprctl_dispatch(&format!(
-                    "movetoworkspace {},address:{}",
-                    active_workspace.id, window_info.address
-                ));
-            } else {
-                eprintln!("[Error] Failed to get active workspace to restore on Ctrl+C. Restoring to original workspace.");
-                // Fallback to original workspace
-                let _ = hyprctl_dispatch(&format!(
-                    "movetoworkspace {},address:{}",
-                    window_info.workspace.id, window_info.address
-                ));
-            }
+            let _ = hyprctl_dispatch(&format!(
+                "movetoworkspace {},address:{}",
+                window_info.workspace.id, window_info.address
+            ));
         }
         _ = exit_notify.notified() => {
             println!("Exit notification received.");
