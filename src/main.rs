@@ -268,7 +268,7 @@ impl StatusNotifierItem {
 
     #[dbus_interface(property)]
     fn item_is_menu(&self) -> bool {
-        true
+        false
     }
 
     #[dbus_interface(property)]
@@ -320,9 +320,7 @@ async fn main() -> Result<()> {
     );
 
     if window_info.class.is_empty() {
-        window_info.class = "application-x-generic".to_string();
-    } else {
-        window_info.class = window_info.class.to_lowercase();
+        window_info.class = window_info.title.clone();
     }
 
     // 2. Move the window to the special "minimized" workspace
